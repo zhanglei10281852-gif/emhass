@@ -1695,18 +1695,103 @@ class TestRetrieveHass(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.rh.df_final.empty, "Resulting DataFrame is empty")
         self.assertIn("sensor.power_load", self.rh.df_final.columns)
 
-        # Test Connection Failure -> Fallback to REST
-        mock_get_ws.side_effect = Exception("Connection refused")
+        # Test Connection Failure -> Fallback to REST. The mock client is not
+        # tracked by the real connection manager (it is force-gone), so the
+        # pinned rh must refuse to reopen an untracked socket and fall back.
+        mock_client.connected = False
+        mock_client.reconnect = AsyncMock(side_effect=Exception("Connection refused"))
         mock_rest_fallback.return_value = True  # Mock REST success
 
         success = await self.rh.get_data(days_list, var_list)
 
         self.assertTrue(success)
         mock_rest_fallback.assert_called_once()
+        mock_client.reconnect.assert_not_awaited()
 
         # Reset side effect
         mock_get_ws.side_effect = None
         self.rh.use_websocket = False
+
+    @patch("emhass.retrieve_hass.release", new_callable=AsyncMock)
+    @patch("emhass.retrieve_hass.retain", new_callable=AsyncMock)
+    @patch("emhass.retrieve_hass.get_websocket_client", new_callable=AsyncMock)
+    async def test_ws_client_retained_once_released_on_close(
+        self, mock_get_ws, mock_retain, mock_release
+    ):
+        """One rh lifetime = one retain on first WS use and one release on close()."""
+        mock_client = MagicMock()
+        mock_client.get_config = AsyncMock(return_value={})
+        mock_get_ws.return_value = mock_client
+        self.rh.use_websocket = True
+
+        await self.rh.get_ha_config_websocket()
+        await self.rh.get_ha_config_websocket()
+        mock_retain.assert_awaited_once_with(mock_client)
+        mock_release.assert_not_awaited()
+
+        await self.rh.close()
+        mock_release.assert_awaited_once_with(mock_client)
+
+        # close() is idempotent: no second release.
+        await self.rh.close()
+        mock_release.assert_awaited_once()
+        self.rh.use_websocket = False
+
+    @patch("emhass.connection_manager.AsyncWebSocketClient")
+    async def test_ws_generation_is_pinned_for_rh_lifetime(self, mock_client_class):
+        """A rh that entered with generation A keeps using A after B activates."""
+        import emhass.connection_manager as cm
+        from emhass.connection_manager import close_global_connection, get_websocket_client
+
+        cm._active_holder = None
+        cm._retired_holders.clear()
+        self.addAsyncCleanup(close_global_connection)
+
+        client_a = MagicMock()
+        client_a.connected = True
+        client_a.startup = AsyncMock()
+        client_a.shutdown = AsyncMock()
+        client_a.reconnect = AsyncMock()
+        client_b = MagicMock()
+        client_b.connected = True
+        client_b.startup = AsyncMock()
+        client_b.shutdown = AsyncMock()
+        mock_client_class.side_effect = [client_a, client_b]
+
+        self.rh.use_websocket = True
+        first = await self.rh._get_active_ws_client()
+        self.assertIs(first, client_a)
+
+        # Dropped but still tracked: reconnect the SAME pinned generation.
+        client_a.connected = False
+        again = await self.rh._get_active_ws_client()
+        self.assertIs(again, client_a)
+        client_a.reconnect.assert_awaited_once()
+        client_a.connected = True
+
+        # A config activation installs generation B for new actions...
+        active_b = await get_websocket_client("http://other-hass:8123/api", "tok-b", logger)
+        self.assertIs(active_b, client_b)
+        self.assertIs(cm._global_client, client_b)
+        # ...but the in-flight rh must keep its pinned A generation and must
+        # not trigger a third connection (which would demote B).
+        second = await self.rh._get_active_ws_client()
+        self.assertIs(second, client_a)
+        self.assertEqual(mock_client_class.call_count, 2)
+        self.assertIs(cm._global_client, client_b)
+
+        # Closing the rh releases A (old generation shuts down), B stays.
+        await self.rh.close()
+        client_a.shutdown.assert_awaited_once()
+        client_b.shutdown.assert_not_awaited()
+        self.rh.use_websocket = False
+
+    @patch("emhass.retrieve_hass.release", new_callable=AsyncMock)
+    async def test_rest_mode_close_does_not_touch_ws_manager(self, mock_release):
+        """REST mode rh instances never retain/release WebSocket generations."""
+        self.rh.use_websocket = False
+        await self.rh.close()
+        mock_release.assert_not_awaited()
 
     async def test_get_data_rest_api_errors(self):
         days_list = pd.date_range(start="2024-01-01", periods=1, freq="D", tz="UTC")

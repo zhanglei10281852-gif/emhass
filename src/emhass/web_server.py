@@ -23,7 +23,6 @@ from quart import logging as log
 from emhass import last_run, plan_store
 from emhass.command_line import (
     EMHASS_SCHEMA_VERSION,
-    continual_publish,
     dayahead_forecast_optim,
     export_influxdb_to_csv,
     forecast_calibration,
@@ -40,6 +39,7 @@ from emhass.command_line import (
     weather_forecast_cache,
 )
 from emhass.connection_manager import close_global_connection, get_websocket_client, is_connected
+from emhass.runtime_manager import ActivationError, ActivationStore, RuntimeManager
 from emhass.utils import (
     HEAT_TOPOLOGY_KEYS,
     build_config,
@@ -61,7 +61,8 @@ app = Quart(__name__)
 emhass_conf: dict[str, Path] = {}
 entity_path: Path = Path()
 params_secrets: dict[str, str | float] = {}
-continual_publish_thread: list = []
+# Active configuration activation boundary (connections + continual publish).
+runtime: RuntimeManager | None = None
 injection_dict: dict = {}
 
 templates = jinja2.Environment(
@@ -122,12 +123,19 @@ async def before_serving():
 async def after_serving():
     """Clean up resources after serving."""
     try:
-        # Only close WebSocket connection if it was established
+        # Stop the continual-publish task and close its HTTP session first.
+        if runtime is not None:
+            await runtime.shutdown()
+    except Exception as e:
+        app.logger.warning(f"Continual publish shutdown failed: {e}")
+    try:
+        # Close every WebSocket generation, including ones retired but still
+        # inside their in-flight grace window: shutdown must not wait on users.
         if is_connected():
-            await close_global_connection()
             app.logger.info("WebSocket connection closed")
         else:
             app.logger.info("No WebSocket connection to close")
+        await close_global_connection()
     except Exception as e:
         app.logger.warning(f"WebSocket shutdown failed: {e}")
     app.logger.info("Quart shutdown complete")
@@ -263,30 +271,29 @@ async def configuration():
                 app.logger.error(f"Error reading secrets file: {e}")
 
         # Update secrets with form data
-        updated = False
+        secrets_patch = {}
         for key in secret_params:
             if key in form_data:
                 value = form_data[key]
                 if value != "***":
                     secrets[key] = value
-                    updated = True
+                    secrets_patch[key] = value
 
-        # Save to file if changes were made (Async)
-        if updated:
+        # Saving secrets is a full activation boundary: params are rebuilt,
+        # the new HA identity is proven, files commit and the active
+        # params_secrets/connection/publish state swap together. Failures keep
+        # the previous configuration serving; the page still renders (the
+        # historical response contract for this endpoint).
+        if secrets_patch:
             try:
-                async with aiofiles.open(secrets_path, "w") as file:
-                    # dump returns string if stream is None
-                    content = yaml.dump(secrets, default_flow_style=False)
-                    await file.write(content)
-
-                app.logger.info("Secrets saved successfully.")
-
-                # Update the global params_secrets
-                global params_secrets
-                params_secrets.update(secrets)
-
+                if runtime is None:
+                    raise RuntimeError("Runtime manager is not initialized")
+                # Only file-scoped keys are persisted to secrets_emhass.yaml;
+                # ENV/options-derived values must not be frozen into the file.
+                await runtime.activate(secrets_patch=secrets_patch, secrets_file=secrets)
+                app.logger.info("Secrets saved and activated successfully.")
             except Exception as e:
-                app.logger.error(f"Error saving secrets file: {e}")
+                app.logger.error(f"Error activating saved secrets: {e}")
 
     app.logger.info("serving configuration.html...")
 
@@ -502,25 +509,17 @@ async def parameter_set():
     # Overwrite existing default parameters in config
     config.update(param_to_config(params, app.logger))
 
-    # Save config to config.json
-    if os.path.exists(emhass_conf["config_path"].parent):
-        async with aiofiles.open(str(emhass_conf["config_path"]), "w") as f:
-            await f.write(orjson.dumps(config, option=orjson.OPT_INDENT_2).decode())
-    else:
-        return await make_response(["Unable to save config file"], 500)
-
-    # Save params with updated config
-    if os.path.exists(emhass_conf["data_path"]):
-        async with aiofiles.open(str(emhass_conf["data_path"] / params_file), "wb") as fid:
-            content = pickle.dumps(
-                (
-                    emhass_conf["config_path"],
-                    await build_params(emhass_conf, params_secrets, config, app.logger),
-                )
-            )
-            await fid.write(content)
-    else:
-        return await make_response(["Unable to save params file, missing data_path"], 500)
+    # Activate as one boundary: recoverable file commit + prepared HA
+    # connection + continual-publish handover. A failure leaves the previous
+    # configuration fully active and the response signals the save did not take
+    # effect (the success body/shape for 200 is unchanged).
+    if runtime is None:
+        return await make_response(["Runtime manager is not initialized"], 500)
+    try:
+        await runtime.activate(config=config)
+    except ActivationError as e:
+        app.logger.error(f"Configuration activation failed: {e}")
+        return await make_response([str(e)], 503)
 
     app.logger.info("Saved parameters from webserver")
     return await make_response({}, 200)
@@ -832,7 +831,6 @@ async def action_call(action_name: str):
     """
     Receive Post action, run action according to passed slug(action_name)
     """
-    global continual_publish_thread
     global injection_dict
 
     # Load Parameters
@@ -870,16 +868,9 @@ async def action_call(action_name: str):
     if not input_data_dict:
         return await make_response(await grab_log(action_str), 400)
 
-    # Handle Continual Publish Threading
-    rh_handed_to_thread = False
-    if len(continual_publish_thread) == 0 and input_data_dict["retrieve_hass_conf"].get(
-        "continual_publish", False
-    ):
-        rh_handed_to_thread = True
-        continual_loop = app.add_background_task(
-            continual_publish, input_data_dict, entity_path, app.logger
-        )
-        continual_publish_thread.append(continual_loop)
+    # Continual publishing is owned by the runtime activation boundary
+    # (PublishManager), not by an individual action: this request's rh is
+    # always closed here, even when publishing is enabled.
 
     # Execute Action
     try:
@@ -887,10 +878,9 @@ async def action_call(action_name: str):
             action_name, input_data_dict, emhass_conf, params, runtimeparams, app.logger
         )
     finally:
-        # Close HTTP session unless this rh was handed to the continual_publish thread.
-        # Each call to set_input_data_dict creates a fresh rh, so closing here only
-        # affects this request's rh, not any previously started background thread's.
-        if not rh_handed_to_thread and "rh" in input_data_dict:
+        # Each call to set_input_data_dict creates a fresh rh; closing it only
+        # affects this request. The continual-publish task owns a separate rh.
+        if "rh" in input_data_dict:
             await input_data_dict["rh"].close()
 
     # Final Log Check & Response
@@ -963,6 +953,32 @@ async def _build_configuration(
         app.logger.setLevel(logging.DEBUG)
 
     return config, costfun, logging_level
+
+
+def _apply_options_data_path(emhass_conf: dict, options_path: Path) -> None:
+    """
+    Apply the options.json data_path redirection before crash recovery.
+
+    Activations write their pending marker inside the (possibly redirected)
+    data_path; recovery must scan that same directory even though
+    build_secrets, which normally performs this redirection, runs only after
+    the secrets file has been restored.
+    """
+    if not options_path or not Path(options_path).is_file():
+        return
+    try:
+        with open(options_path, "rb") as fid:
+            options = orjson.loads(fid.read())
+        data_path_value = options.get("data_path", None)
+        if data_path_value not in (None, "", "default"):
+            data_path = Path(data_path_value)
+            data_path.mkdir(parents=True, exist_ok=True)
+            emhass_conf["data_path"] = data_path
+            app.logger.info(f"Using custom data_path: {data_path}")
+    except Exception as e:
+        app.logger.warning(
+            f"Cannot apply data_path from options.json '{options_path}', keeping default. Error: {e}"
+        )
 
 
 async def _setup_secrets(args: dict | None, options_path: Path) -> str:
@@ -1125,8 +1141,26 @@ async def _initialize_connections(params: dict) -> None:
         )
 
 
+def _apply_active_secrets(secrets: dict) -> None:
+    """Callback: an activation committed new secrets into the active state."""
+    global params_secrets
+    params_secrets.update(secrets)
+
+
+def _build_runtime() -> RuntimeManager:
+    """Construct the singleton runtime activation manager for this process."""
+    global runtime
+    runtime = RuntimeManager(
+        emhass_conf,
+        emhass_conf["data_path"] / "entities",
+        app.logger,
+        on_secrets_activated=_apply_active_secrets,
+    )
+    return runtime
+
+
 async def initialize(args: dict | None = None):
-    global emhass_conf, params_secrets, continual_publish_thread, injection_dict, entity_path
+    global emhass_conf, params_secrets, injection_dict, entity_path, runtime
     # Grab the logging level early from ENV so initialization functions can log properly
     early_log_level = os.getenv("LOGGING_LEVEL", "INFO")
     normalized_log_level = early_log_level.upper()
@@ -1141,6 +1175,14 @@ async def initialize(args: dict | None = None):
         legacy_config_path,
         root_path,
     ) = await _setup_paths()
+    # Resolve an options.json data_path redirection first so crash recovery
+    # scans the same directory activations actually wrote to.
+    _apply_options_data_path(emhass_conf, options_path)
+    # Roll back any interrupted configuration switch BEFORE reading secrets or
+    # config: secrets_emhass.yaml has higher precedence than ENV/options, so the
+    # restored file must already be back to the last activated generation when
+    # build_secrets runs below.
+    await ActivationStore(emhass_conf["data_path"], app.logger).recover_pending()
     # Setup Secrets (must run BEFORE build_configuration to allow options.json to override config_path)
     server_ip = await _setup_secrets(args, options_path)
     # Build configuration (now uses potentially updated emhass_conf["config_path"] from options.json)
@@ -1149,19 +1191,43 @@ async def initialize(args: dict | None = None):
         emhass_conf.get("legacy_config_path", legacy_config_path),
         defaults_path,
     )
-    # Validate Data Path
+    # Validate Data Path before constructing the runtime: a redirected
+    # data_path must be the final location for activation markers/publish data.
     _validate_data_path(root_path)
+    # Build the runtime manager once paths are final.
+    runtime = _build_runtime()
     # Load Injection Dict
     injection_dict = await _load_injection_dict()
     # Build and Save Params
     params = await _build_and_save_params(config, costfun, logging_level, config_path)
+    # Track the on-disk secrets file content so a post-commit rollback of the
+    # first /configuration activation can restore it exactly (or remove a file
+    # that did not exist at boot).
+    boot_secrets_path = emhass_conf.get("secrets_path")
+    boot_secrets_existed = bool(
+        boot_secrets_path is not None and Path(boot_secrets_path).is_file()
+    )
+    boot_secrets_file = None
+    if boot_secrets_existed:
+        try:
+            with open(boot_secrets_path) as fid:
+                loaded_secrets = yaml.safe_load(fid)
+            if isinstance(loaded_secrets, dict):
+                boot_secrets_file = loaded_secrets
+        except Exception as e:
+            app.logger.warning(f"Could not parse existing secrets file for tracking: {e}")
+    # Publish the restored configuration as the in-process active generation.
+    runtime.set_active(
+        params,
+        params_secrets,
+        config,
+        secrets_file=boot_secrets_file,
+        secrets_file_existed=boot_secrets_existed,
+    )
     # Configure Logging
     await _configure_logging(logging_level)
     # Cleanup Entities
     entity_path = _cleanup_entities()
-    # Initialize Continual Publish Thread
-    # Initialise continual publish thread list
-    continual_publish_thread = []
     # Log Startup Info
     # Logging
     port = int(os.environ.get("PORT", 5000))
@@ -1176,8 +1242,16 @@ async def initialize(args: dict | None = None):
         app.logger.info("Using core emhass version: " + version("emhass"))
     except PackageNotFoundError:
         app.logger.info("Using development emhass version")
-    # Initialize Connections (WebSocket/InfluxDB)
-    await _initialize_connections(params)
+    # Initialize Connections (WebSocket/InfluxDB). Best-effort: the service
+    # must still reach the point where continual publishing (REST-based) boots
+    # even when a WebSocket cannot be established at startup.
+    try:
+        await _initialize_connections(params)
+    except Exception as e:
+        app.logger.warning(f"WebSocket initialization failed, continuing: {e}")
+    # Start continual publishing when the restored active configuration enables
+    # it; disabled (the default) starts nothing.
+    await runtime.bootstrap_publish()
     app.logger.info("Initialization complete")
 
 

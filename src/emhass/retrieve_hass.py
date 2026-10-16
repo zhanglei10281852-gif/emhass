@@ -17,7 +17,12 @@ import numpy as np
 import orjson
 import pandas as pd
 
-from emhass.connection_manager import get_websocket_client
+from emhass.connection_manager import (
+    get_websocket_client,
+    is_generation_served,
+    release,
+    retain,
+)
 from emhass.utils import set_df_index_freq
 
 logger = logging.getLogger(__name__)
@@ -158,9 +163,12 @@ class RetrieveHass:
             self.logger.warning("SSL verification is disabled for Home Assistant connection.")
         # Check websocket activation
         self.use_websocket = self.params.get("retrieve_hass_conf", {}).get("use_websocket", False)
-        if self.use_websocket:
-            self._client = None
-        else:
+        # The active WS generation is retained on first acquisition and
+        # released once in close(), so a config activation that swaps the
+        # global generation does not shut a connection still serving this rh.
+        self._client = None
+        self._ws_retained = False
+        if not self.use_websocket:
             self.logger.debug("Websocket integration disabled, using Home Assistant API")
         # Initialize InfluxDB configuration
         self.use_influxdb = self.params.get("retrieve_hass_conf", {}).get("use_influxdb", False)
@@ -235,6 +243,47 @@ class RetrieveHass:
             if self._session is not None and not self._session.closed:
                 await self._session.close()
                 self._session = None
+        # Release the retained WebSocket generation (if any): this is the
+        # signal the connection manager waits for before closing an old
+        # generation replaced by a config activation.
+        if self.use_websocket and self._ws_retained and self._client is not None:
+            try:
+                await release(self._client)
+            except Exception:
+                pass
+            self._ws_retained = False
+
+    async def _get_active_ws_client(self):
+        """
+        Return the WebSocket generation this rh pinned at first acquisition.
+
+        An action must finish against the configuration it entered with: once
+        a generation has been retained it is reused for every later call, so a
+        config activation swapping the active generation underneath us can
+        neither create a second connection to the old identity nor demote the
+        new active generation.
+        """
+        if self._ws_retained and self._client is not None:
+            # Pinned to the entry-time generation: never re-resolve identity
+            # (that would build a parallel old-generation client and demote the
+            # new active one). If the pinned connection dropped mid-action,
+            # reconnect that same client as long as the manager still tracks
+            # it; a force-closed (grace-elapsed) generation must not be silently
+            # reopened as an untracked socket.
+            if not self._client.connected:
+                if not await is_generation_served(self._client):
+                    raise ConnectionError(
+                        "Pinned WebSocket generation was retired and closed"
+                    )
+                await self._client.reconnect()
+            return self._client
+        client = await get_websocket_client(
+            self.hass_url, self.long_lived_token, self.logger
+        )
+        await retain(client)
+        self._ws_retained = True
+        self._client = client
+        return client
 
     async def __aenter__(self) -> Self:
         """Enter async context manager."""
@@ -326,9 +375,7 @@ class RetrieveHass:
     async def get_ha_config_websocket(self) -> dict[str, Any]:
         """Get Home Assistant configuration."""
         try:
-            self._client = await get_websocket_client(
-                self.hass_url, self.long_lived_token, self.logger
-            )
+            self._client = await self._get_active_ws_client()
             self.ha_config = await self._client.get_config()
             return self.ha_config
         except Exception as e:
@@ -683,10 +730,7 @@ class RetrieveHass:
         :rtype: pandas.DataFrame
         """
         try:
-            self._client = await asyncio.wait_for(
-                get_websocket_client(self.hass_url, self.long_lived_token, self.logger),
-                timeout=20.0,
-            )
+            self._client = await asyncio.wait_for(self._get_active_ws_client(), timeout=20.0)
         except TimeoutError:
             self.logger.error("WebSocket connection timed out")
             return False

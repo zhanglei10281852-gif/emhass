@@ -33,12 +33,25 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         web_server.emhass_conf = self.mock_conf
         # Mock params_secrets
         web_server.params_secrets = {"hass_url": "http://localhost", "long_lived_token": "token"}
+        # Stub the activation boundary: endpoint-level tests validate request
+        # plumbing and response contracts; activation itself is covered by
+        # tests/test_runtime_manager.py and integration tests.
+        self.original_runtime = web_server.runtime
+        stub_runtime = MagicMock()
+        stub_runtime.activate = AsyncMock(return_value=MagicMock())
+        stub_runtime.shutdown = AsyncMock()
+        stub_runtime.startup_recover = AsyncMock(return_value=False)
+        stub_runtime.bootstrap_publish = AsyncMock()
+        stub_runtime.set_active = MagicMock()
+        web_server.runtime = stub_runtime
         # Save original handlers to restore later
         self.original_handlers = web_server.app.logger.handlers[:]
 
     async def asyncTearDown(self):
         # Restore original config
         web_server.emhass_conf = self.original_conf
+        # Restore runtime manager stub
+        web_server.runtime = self.original_runtime
         # Restore original log handlers to prevent 'MagicMock' level errors in subsequent tests
         web_server.app.logger.handlers = self.original_handlers
 
@@ -137,7 +150,10 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         mock_p2c.return_value = {"new": "config"}
         response = await self.client.post("/set-config", json={"some": "data"})
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(f_write.write.called)
+        # Saving now hands the merged config to the activation boundary.
+        web_server.runtime.activate.assert_awaited_once()
+        saved_config = web_server.runtime.activate.call_args.kwargs["config"]
+        self.assertEqual(saved_config, {"new": "config"})
 
     @patch("emhass.web_server.aiofiles.open")
     @patch("os.path.exists")
@@ -217,7 +233,7 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         }
         response = await self.client.post("/set-config", json={"heat_topology": good_topology})
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(f_write.write.called)
+        web_server.runtime.activate.assert_awaited_once()
 
     @patch("emhass.web_server.set_input_data_dict")
     @patch("emhass.web_server.perfect_forecast_optim")
@@ -381,6 +397,35 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
         await web_server.clear_file_log()
         f.write.assert_called_with("")
 
+    async def test_apply_options_data_path_redirects_before_recovery(self):
+        """N-01: an options.json custom data_path is applied pre-recovery."""
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = pathlib.Path(tmp)
+            custom_data = tmp_path / "custom-data"
+            options_file = tmp_path / "options.json"
+            options_file.write_text(
+                orjson.dumps({"data_path": str(custom_data)}).decode()
+            )
+            conf = {"data_path": tmp_path / "default-data"}
+            web_server._apply_options_data_path(conf, options_file)
+            self.assertEqual(conf["data_path"], custom_data)
+            self.assertTrue(custom_data.is_dir())
+
+            # "default" and missing files leave the path untouched.
+            options_default = tmp_path / "opts-default.json"
+            options_default.write_text(orjson.dumps({"data_path": "default"}).decode())
+            conf2 = {"data_path": tmp_path / "d2"}
+            web_server._apply_options_data_path(conf2, options_default)
+            self.assertEqual(conf2["data_path"], tmp_path / "d2")
+            web_server._apply_options_data_path(conf2, tmp_path / "missing.json")
+            self.assertEqual(conf2["data_path"], tmp_path / "d2")
+
+            # Corrupt options must not raise.
+            bad = tmp_path / "bad.json"
+            bad.write_text("{not json")
+            web_server._apply_options_data_path(conf2, bad)
+            self.assertEqual(conf2["data_path"], tmp_path / "d2")
+
     @patch("emhass.web_server.initialize")
     async def test_before_serving(self, mock_init):
         # Happy path
@@ -394,15 +439,143 @@ class TestWebServer(unittest.IsolatedAsyncioTestCase):
     @patch("emhass.web_server.is_connected")
     @patch("emhass.web_server.close_global_connection")
     async def test_after_serving(self, mock_close, mock_is_conn):
-        # Connected
+        # All WebSocket generations (active and retired) are closed on shutdown.
         mock_is_conn.return_value = True
         await web_server.after_serving()
         mock_close.assert_called_once()
-        # Not connected
+        # No active connection: retired generations in their grace window are
+        # still closed unconditionally.
         mock_is_conn.return_value = False
         mock_close.reset_mock()
         await web_server.after_serving()
-        mock_close.assert_not_called()
+        mock_close.assert_called_once()
+
+    async def test_after_serving_stops_continual_publish(self):
+        """Shutdown stops the publish runner before the WS connection close."""
+        with (
+            patch("emhass.web_server.is_connected", return_value=False),
+            patch("emhass.web_server.close_global_connection", new_callable=AsyncMock),
+        ):
+            await web_server.after_serving()
+        web_server.runtime.shutdown.assert_awaited()
+
+    @patch("emhass.web_server.build_params")
+    async def test_parameter_set_activation_failure_returns_503(self, mock_build_params):
+        """An activation failure keeps the old config serving and returns 503."""
+        from emhass.runtime_manager import ActivationConnectionError
+
+        mock_build_params.return_value = {
+            "retrieve_hass_conf": {},
+            "optim_conf": {},
+            "plant_conf": {},
+        }
+        web_server.runtime.activate.side_effect = ActivationConnectionError("HA unreachable")
+        response = await self.client.post("/set-config", json={"some": "data"})
+        self.assertEqual(response.status_code, 503)
+        body = await response.get_json()
+        self.assertIn("HA unreachable", body[0])
+        web_server.runtime.activate.side_effect = None
+
+    async def test_configuration_secrets_activate_on_post(self):
+        """The secrets form routes through the activation boundary."""
+        web_server.emhass_conf["secrets_path"] = pathlib.Path(
+            "/tmp/emhass/nonexistent-secrets.yaml"
+        )
+        response = await self.client.post(
+            "/configuration", form={"hass_url": "http://new-ha:8123/api"}
+        )
+        self.assertEqual(response.status_code, 200)
+        web_server.runtime.activate.assert_awaited_once()
+        kwargs = web_server.runtime.activate.call_args.kwargs
+        self.assertEqual(kwargs["secrets_patch"], {"hass_url": "http://new-ha:8123/api"})
+        self.assertEqual(
+            kwargs["secrets_file"], {"hass_url": "http://new-ha:8123/api"}
+        )
+
+    async def test_configuration_still_renders_when_activation_fails(self):
+        """The /configuration response contract stays 200 HTML on failure."""
+        from emhass.runtime_manager import ActivationConnectionError
+
+        web_server.emhass_conf["secrets_path"] = pathlib.Path(
+            "/tmp/emhass/nonexistent-secrets.yaml"
+        )
+        web_server.runtime.activate.side_effect = ActivationConnectionError("boom")
+        response = await self.client.post(
+            "/configuration", form={"long_lived_token": "new-token"}
+        )
+        self.assertEqual(response.status_code, 200)
+        result = await response.get_data(as_text=True)
+        self.assertIn("EMHASS", result)
+        web_server.runtime.activate.side_effect = None
+
+    @patch("emhass.web_server._save_injection_dict", new_callable=AsyncMock)
+    @patch("emhass.web_server.get_injection_dict")
+    @patch("emhass.web_server.perfect_forecast_optim", new_callable=AsyncMock)
+    @patch("emhass.web_server.set_input_data_dict", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_action_with_publish_enabled_does_not_start_background_task(
+        self, mock_load, mock_set_input, mock_optim, mock_get_inject, mock_save
+    ):
+        """Continual publishing is owned by the manager, never by an action."""
+        rh = AsyncMock()
+        mock_load.return_value = ({"optim_conf": {}}, "profit", "{}")
+        mock_set_input.return_value = {
+            "retrieve_hass_conf": {"continual_publish": True},
+            "rh": rh,
+        }
+        mock_optim.return_value = pd.DataFrame()
+        mock_get_inject.return_value = {}
+        with patch.object(web_server.app, "add_background_task") as mock_bg:
+            response = await self.client.post("/action/perfect-optim", json={})
+        self.assertEqual(response.status_code, 200)
+        mock_bg.assert_not_called()
+        rh.close.assert_awaited_once()
+
+    @patch("emhass.web_server._save_injection_dict", new_callable=AsyncMock)
+    @patch("emhass.web_server.get_injection_dict")
+    @patch("emhass.web_server.perfect_forecast_optim", new_callable=AsyncMock)
+    @patch("emhass.web_server.set_input_data_dict", new_callable=AsyncMock)
+    @patch("emhass.web_server._load_params_and_runtime", new_callable=AsyncMock)
+    async def test_concurrent_actions_use_their_entry_time_params(
+        self, mock_load, mock_set_input, mock_optim, mock_get_inject, mock_save
+    ):
+        """Each action resolves against its own params snapshot, never a mix."""
+        mock_load.side_effect = [
+            ({"optim_conf": {}, "gen": "A"}, "profit", "{}"),
+            ({"optim_conf": {}, "gen": "B"}, "profit", "{}"),
+        ]
+
+        rhs = []
+
+        async def set_input_side(
+            emhass_conf, costfun, params, runtimeparams, action_name, logger
+        ):
+            params_obj = orjson.loads(params) if isinstance(params, str) else params
+            gen = params_obj["gen"]
+            rh = AsyncMock()
+            rhs.append((gen, rh))
+            return {
+                "retrieve_hass_conf": {"continual_publish": False},
+                "rh": rh,
+                "gen": gen,
+            }
+
+        mock_set_input.side_effect = set_input_side
+        mock_optim.return_value = pd.DataFrame()
+        mock_get_inject.return_value = {}
+
+        await self.client.post("/action/perfect-optim", json={})
+        await self.client.post("/action/perfect-optim", json={})
+
+        observed = [
+            orjson.loads(p)["gen"] if isinstance(p, str) else p["gen"]
+            for p in (call.args[2] for call in mock_set_input.call_args_list)
+        ]
+        self.assertEqual(observed, ["A", "B"])
+        # Each action closes exactly the rh built from its own params snapshot.
+        self.assertEqual([gen for gen, _ in rhs], ["A", "B"])
+        for _, rh in rhs:
+            rh.close.assert_awaited_once()
 
     @patch("pathlib.Path.exists")
     @patch("emhass.web_server.aiofiles.open")

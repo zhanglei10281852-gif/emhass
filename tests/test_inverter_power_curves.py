@@ -369,6 +369,7 @@ INVALID_CURVE = [[1000, 1.1], [2000, 0.9]]  # efficiency above 1 is physically i
 def web(tmp_path, monkeypatch):
     """The real web_server app on scratch paths (real defaults, associations, build_params)."""
     from emhass import web_server
+    from emhass.runtime_manager import RuntimeManager
 
     conf = {
         "data_path": tmp_path,
@@ -378,9 +379,24 @@ def web(tmp_path, monkeypatch):
         "legacy_config_path": tmp_path / "legacy_missing.yaml",
         "root_path": EMHASS_CONF["root_path"],
     }
-    _, secrets = asyncio.run(utils.build_secrets(conf, logger, no_response=True))
+    # One loop for the fixture: the activation lock and publisher must not
+    # hop between per-request loops.
+    loop = asyncio.new_event_loop()
+    _, secrets = loop.run_until_complete(
+        utils.build_secrets(conf, logger, no_response=True)
+    )
+    config = loop.run_until_complete(
+        utils.build_config(conf, logger, str(conf["defaults_path"]))
+    )
+    params = loop.run_until_complete(
+        utils.build_params(conf, secrets, config, logger)
+    )
+    manager = RuntimeManager(conf, tmp_path / "entities", logger)
+    manager.set_active(params, secrets, config)
+
     monkeypatch.setattr(web_server, "emhass_conf", conf)
     monkeypatch.setattr(web_server, "params_secrets", secrets)
+    monkeypatch.setattr(web_server, "runtime", manager)
     client = web_server.app.test_client()
 
     def post(body):
@@ -388,25 +404,29 @@ def web(tmp_path, monkeypatch):
             r = await client.post("/set-config", json=body)
             return r.status_code, await r.get_json()
 
-        return asyncio.run(go())
+        return loop.run_until_complete(go())
 
     def get_config():
         async def go():
             r = await client.get("/get-config")
             return r.status_code, await r.get_json()
 
-        return asyncio.run(go())
+        return loop.run_until_complete(go())
 
-    return type(
-        "Web",
-        (),
-        {
-            "conf": conf,
-            "post": staticmethod(post),
-            "get": staticmethod(get_config),
-            "ws": web_server,
-        },
-    )
+    try:
+        yield type(
+            "Web",
+            (),
+            {
+                "conf": conf,
+                "post": staticmethod(post),
+                "get": staticmethod(get_config),
+                "ws": web_server,
+            },
+        )
+    finally:
+        loop.run_until_complete(manager.shutdown())
+        loop.close()
 
 
 def test_set_config_rejects_an_invalid_active_curve_without_touching_saved_files(web):
