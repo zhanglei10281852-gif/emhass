@@ -5,10 +5,36 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import orjson
 
-from emhass.websocket_client import AsyncWebSocketClient, AuthenticationError, RequestError
+from emhass.websocket_client import (
+    AsyncWebSocketClient,
+    AuthenticationError,
+    ConnectionError as WSConnectionError,
+    RequestError,
+)
 
 # Disable logging for tests
 logging.basicConfig(level=logging.CRITICAL)
+
+
+class FakeWebSocket:
+    """Queue-driven websocket stand-in that can simulate transport death."""
+
+    def __init__(self, response_queue: asyncio.Queue):
+        self.response_queue = response_queue
+        self.sent: list[str] = []
+        self.closed = False
+
+    async def send(self, message):
+        self.sent.append(message)
+
+    async def recv(self):
+        item = await self.response_queue.get()
+        if isinstance(item, BaseException):
+            raise item
+        return item
+
+    async def close(self):
+        self.closed = True
 
 
 class TestWebSocketClient(unittest.IsolatedAsyncioTestCase):
@@ -200,6 +226,203 @@ class TestWebSocketClient(unittest.IsolatedAsyncioTestCase):
         # The client should implicitly skip ID 999 and return ID 1
         result = await self.client.send("test_command")
         self.assertEqual(result, {"foo": "bar"})
+        await self.client.shutdown()
+
+
+    @patch("emhass.websocket_client.websockets.connect", new_callable=AsyncMock)
+    async def test_timeout_releases_pending_and_late_response_discarded(self, mock_connect):
+        """A wait_for timeout must remove the pending slot; the late response
+        must be discarded without killing the shared receiver."""
+        self._setup_mock_ws(mock_connect)
+        await self.response_queue.put(orjson.dumps({"type": "auth_required"}).decode())
+        await self.response_queue.put(orjson.dumps({"type": "auth_ok"}).decode())
+        await self.client.startup()
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(
+                self.client.send("recorder/statistics_during_period"), timeout=0.2
+            )
+
+        # The timed-out request is released immediately...
+        self.assertEqual(self.client._pending, {})
+        # ...and the shared receiver / heartbeat are still alive.
+        self.assertFalse(self.client._recv_task.done())
+        self.assertFalse(self.client._recv_task.cancelled())
+        self.assertFalse(self.client._ping_task.done())
+
+        # Late response for the dead id arrives first, then a fresh command's
+        # response. The late one must be dropped and the new one delivered.
+        await self.response_queue.put(
+            orjson.dumps({"id": 1, "type": "result", "success": True, "result": "late"}).decode()
+        )
+        await self.response_queue.put(
+            orjson.dumps({"id": 2, "type": "result", "success": True, "result": "fresh"}).decode()
+        )
+        result = await self.client.send("get_config")
+        self.assertEqual(result, "fresh")
+        self.assertEqual(self.client._pending, {})
+        self.assertFalse(self.client._recv_task.done())
+        await self.client.shutdown()
+
+    @patch("emhass.websocket_client.websockets.connect", new_callable=AsyncMock)
+    async def test_timeout_does_not_affect_concurrent_commands(self, mock_connect):
+        """One command timing out must not fail or disturb other in-flight
+        commands on the same shared connection."""
+        self._setup_mock_ws(mock_connect)
+        await self.response_queue.put(orjson.dumps({"type": "auth_required"}).decode())
+        await self.response_queue.put(orjson.dumps({"type": "auth_ok"}).decode())
+        await self.client.startup()
+
+        task_slow = asyncio.create_task(self.client.send("get_config"))
+        task_other = asyncio.create_task(self.client.send("get_states"))
+        await asyncio.sleep(0.05)
+        self.assertEqual(set(self.client._pending), {1, 2})
+
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(task_slow, timeout=0.2)
+
+        # Only the timed-out request was released; the other keeps waiting.
+        self.assertEqual(set(self.client._pending), {2})
+        self.assertFalse(task_other.done())
+
+        # Late response for id 1 followed by the real response for id 2.
+        await self.response_queue.put(
+            orjson.dumps({"id": 1, "type": "result", "success": True, "result": "late"}).decode()
+        )
+        await self.response_queue.put(
+            orjson.dumps(
+                {"id": 2, "type": "result", "success": True, "result": [{"entity_id": "x"}]}
+            ).decode()
+        )
+        states = await task_other
+        self.assertEqual(states, [{"entity_id": "x"}])
+        self.assertEqual(self.client._pending, {})
+        self.assertFalse(self.client._recv_task.done())
+        await self.client.shutdown()
+
+    @patch("emhass.websocket_client.websockets.connect", new_callable=AsyncMock)
+    async def test_transport_death_fails_all_pending_and_connection_rebuilds(
+        self, mock_connect
+    ):
+        """A real transport break must fail every in-flight request fast and
+        allow later sends to rebuild an authenticated connection."""
+        fake_ws = FakeWebSocket(self.response_queue)
+        mock_connect.return_value = fake_ws
+        await self.response_queue.put(orjson.dumps({"type": "auth_required"}).decode())
+        await self.response_queue.put(orjson.dumps({"type": "auth_ok"}).decode())
+        await self.client.startup()
+
+        task_one = asyncio.create_task(self.client.send("get_config"))
+        task_two = asyncio.create_task(self.client.send("get_states"))
+        await asyncio.sleep(0.05)
+        self.assertEqual(set(self.client._pending), {1, 2})
+
+        # Receiver observes the broken transport.
+        await self.response_queue.put(RuntimeError("connection closed by peer"))
+        await asyncio.sleep(0.1)
+
+        self.assertFalse(self.client.connected)
+        self.assertEqual(self.client._pending, {})
+        for task in (task_one, task_two):
+            with self.assertRaises(WSConnectionError):
+                await task
+        # Both background tasks of the dead generation are gone and the dead
+        # socket was closed rather than leaked.
+        self.assertTrue(self.client._recv_task.done())
+        self.assertTrue(self.client._ping_task.done())
+        self.assertTrue(fake_ws.closed)
+        await asyncio.sleep(0)
+        self.assertEqual(self.client._bg_closes, set())
+
+        # A subsequent send rebuilds the connection through the same client.
+        mock_ws = MagicMock()
+        mock_ws.send = AsyncMock(
+            side_effect=lambda message: self.client._pending[
+                orjson.loads(message)["id"]
+            ].set_result({"rebuilt": True})
+        )
+        mock_ws.close = AsyncMock()
+
+        async def fake_connect():
+            self.client._ws = mock_ws
+            self.client._id = 0
+            self.client._pending = {}
+            self.client._connected = True
+            self.client._authenticated = True
+
+        self.client._connect = AsyncMock(side_effect=fake_connect)
+        result = await asyncio.wait_for(self.client.send("get_config"), timeout=5.0)
+        self.assertEqual(result, {"rebuilt": True})
+        self.client._connect.assert_awaited_once()
+        await self.client.shutdown()
+
+    @patch("emhass.websocket_client.websockets.connect", new_callable=AsyncMock)
+    async def test_shutdown_joins_tasks_and_ends_pending(self, mock_connect):
+        """Explicit shutdown must converge receiver + ping tasks and give every
+        pending request a definite ConnectionError result."""
+        self._setup_mock_ws(mock_connect)
+        await self.response_queue.put(orjson.dumps({"type": "auth_required"}).decode())
+        await self.response_queue.put(orjson.dumps({"type": "auth_ok"}).decode())
+        await self.client.startup()
+
+        pending_task = asyncio.create_task(self.client.send("get_config"))
+        await asyncio.sleep(0.05)
+        self.assertEqual(set(self.client._pending), {1})
+
+        await self.client.shutdown()
+
+        with self.assertRaises(WSConnectionError):
+            await pending_task
+        self.assertEqual(self.client._pending, {})
+        self.assertIsNone(self.client._recv_task)
+        self.assertIsNone(self.client._ping_task)
+        self.assertEqual(self.client._bg_closes, set())
+        self.assertFalse(self.client.connected)
+
+    @patch("emhass.websocket_client.websockets.connect", new_callable=AsyncMock)
+    async def test_malformed_frame_does_not_kill_receiver(self, mock_connect):
+        """A single unparseable / unexpected frame must not terminate the
+        shared receiver; subsequent commands still complete."""
+        self._setup_mock_ws(mock_connect)
+        await self.response_queue.put(orjson.dumps({"type": "auth_required"}).decode())
+        await self.response_queue.put(orjson.dumps({"type": "auth_ok"}).decode())
+        await self.client.startup()
+
+        await self.response_queue.put("this is not json")
+        await self.response_queue.put(
+            orjson.dumps({"id": 1, "type": "result", "success": True, "result": "ok"}).decode()
+        )
+        result = await self.client.send("get_config")
+        self.assertEqual(result, "ok")
+        self.assertFalse(self.client._recv_task.done())
+        await self.client.shutdown()
+
+    @patch("emhass.websocket_client.websockets.connect", new_callable=AsyncMock)
+    async def test_cancelled_caller_releases_slot(self, mock_connect):
+        """Direct task cancellation (not just wait_for) releases the pending
+        slot and a late response is discarded safely."""
+        self._setup_mock_ws(mock_connect)
+        await self.response_queue.put(orjson.dumps({"type": "auth_required"}).decode())
+        await self.response_queue.put(orjson.dumps({"type": "auth_ok"}).decode())
+        await self.client.startup()
+
+        task = asyncio.create_task(self.client.send("get_config"))
+        await asyncio.sleep(0.05)
+        self.assertEqual(set(self.client._pending), {1})
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertEqual(self.client._pending, {})
+
+        await self.response_queue.put(
+            orjson.dumps({"id": 1, "type": "result", "success": True, "result": "late"}).decode()
+        )
+        await self.response_queue.put(
+            orjson.dumps({"id": 2, "type": "result", "success": True, "result": "next"}).decode()
+        )
+        result = await self.client.send("get_config")
+        self.assertEqual(result, "next")
+        self.assertFalse(self.client._recv_task.done())
         await self.client.shutdown()
 
 
